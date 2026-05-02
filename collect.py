@@ -83,7 +83,7 @@ def collect_pr_comments(
                     "pr_title": pr.title,
                     "pr_state": pr.state,
                     "file": comment.path,
-                    "line": comment.original_line or comment.line,
+                    "line": getattr(comment, "original_line", None) or getattr(comment, "line", None),
                     "diff_hunk": comment.diff_hunk,
                     "body": body,
                     "created_at": comment.created_at.isoformat(),
