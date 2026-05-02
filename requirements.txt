@@ -1,0 +1,5 @@
+PyGithub==2.3.0
+python-dotenv==1.0.1
+anthropic==0.28.0
+chromadb==0.5.3
+ 
