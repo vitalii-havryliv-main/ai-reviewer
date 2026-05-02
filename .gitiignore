@@ -1,0 +1,14 @@
+# Environment
+.env
+ 
+# Data — generated locally, never commit
+data/
+db/
+ 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+ 
