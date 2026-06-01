@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-review.py — reviews your current branch diff against base using team's past PR comments
-            + full file context per hunk to reduce false positives
+review.py — AI code reviewer with agentic file lookup for cross-file verification
 
 Usage:
     python review.py
@@ -26,18 +25,16 @@ import anthropic
 
 load_dotenv()
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-COLLECTION_NAME = "pr_reviews"
-CLAUDE_MODEL = "claude-sonnet-4-6"
+EMBEDDING_MODEL  = "text-embedding-3-small"
+COLLECTION_NAME  = "pr_reviews"
+CLAUDE_MODEL     = "claude-sonnet-4-6"
 
-# How many lines around each hunk to include as context when file is large
-HUNK_CONTEXT_LINES = 100
-# Max file size to include fully (in lines)
-MAX_FULL_FILE_LINES = 300
-# Minimum similarity score to include a past comment
-MIN_SIMILARITY = 0.5
-# How many past comments to retrieve per chunk
-TOP_N_COMMENTS = 10
+HUNK_CONTEXT_LINES  = 100   # lines around each hunk for large files
+MAX_FULL_FILE_LINES = 300   # files smaller than this are included fully
+MIN_SIMILARITY      = 0.5   # RAG threshold
+TOP_N_COMMENTS      = 10    # past comments per file
+MAX_LOOKUP_ROUNDS   = 3     # max agentic file-lookup rounds per file
+MAX_LOOKUP_FILES    = 5     # max extra files Claude can request per file
 
 
 # ---------------------------------------------------------------------------
@@ -45,22 +42,19 @@ TOP_N_COMMENTS = 10
 # ---------------------------------------------------------------------------
 
 def get_current_branch() -> str:
-    result = subprocess.run(
-        ["git", "branch", "--show-current"],
-        capture_output=True, text=True,
-    )
-    branch = result.stdout.strip()
+    r = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True)
+    branch = r.stdout.strip()
     if not branch:
         raise ValueError("Could not detect current git branch. Are you in a git repo?")
     return branch
 
 
 def get_diff(base_branch: str, current_branch: str) -> str:
-    result = subprocess.run(
+    r = subprocess.run(
         ["git", "diff", f"{base_branch}...{current_branch}"],
         capture_output=True, text=True,
     )
-    diff = result.stdout.strip()
+    diff = r.stdout.strip()
     if not diff:
         raise ValueError(
             f"No diff found between '{base_branch}' and '{current_branch}'. "
@@ -70,39 +64,29 @@ def get_diff(base_branch: str, current_branch: str) -> str:
 
 
 def get_repo_root() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True,
-    )
-    return result.stdout.strip()
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return r.stdout.strip()
 
 
 # ---------------------------------------------------------------------------
-# Diff parsing — split into per-file chunks with hunk line numbers
+# Diff parsing
 # ---------------------------------------------------------------------------
 
 def parse_diff_by_file(diff: str) -> list[dict]:
-    """
-    Split diff into per-file entries.
-    Returns list of:
-      { "file": str, "diff": str, "hunks": [{"start": int, "end": int}] }
-    """
     files = []
     current: dict | None = None
-
-    hunk_header_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
     for line in diff.split("\n"):
         if line.startswith("diff --git "):
             if current:
                 files.append(current)
-            # Extract b/ path
             match = re.search(r" b/(.+)$", line)
             file_path = match.group(1) if match else "unknown"
             current = {"file": file_path, "diff": line + "\n", "hunks": []}
         elif current is not None:
             current["diff"] += line + "\n"
-            m = hunk_header_re.match(line)
+            m = hunk_re.match(line)
             if m:
                 start = int(m.group(1))
                 length = int(m.group(2)) if m.group(2) else 1
@@ -110,18 +94,17 @@ def parse_diff_by_file(diff: str) -> list[dict]:
 
     if current:
         files.append(current)
-
     return files
 
 
 # ---------------------------------------------------------------------------
-# Full file context
+# File reading
 # ---------------------------------------------------------------------------
 
-def read_file_context(file_path: str, hunks: list[dict], repo_root: str) -> str | None:
+def read_file(file_path: str, repo_root: str, hunks: list[dict] | None = None) -> str | None:
     """
-    Read the full file or ±HUNK_CONTEXT_LINES around each hunk.
-    Returns None if file doesn't exist (deleted file).
+    Read a file from repo. If hunks provided and file is large — return context only.
+    If hunks is None (lookup request) — return full file up to 500 lines.
     """
     full_path = os.path.join(repo_root, file_path)
     if not os.path.exists(full_path):
@@ -133,42 +116,44 @@ def read_file_context(file_path: str, hunks: list[dict], repo_root: str) -> str 
     except Exception:
         return None
 
-    total_lines = len(lines)
+    total = len(lines)
 
-    # Small file — return everything
-    if total_lines <= MAX_FULL_FILE_LINES:
-        content = "".join(lines)
-        return f"=== FULL FILE: {file_path} ({total_lines} lines) ===\n{content}"
+    # For lookup requests — return full file capped at 500 lines
+    if hunks is None:
+        cap = 500
+        content = "".join(lines[:cap])
+        truncated = f" (truncated to {cap} lines)" if total > cap else ""
+        return f"=== FILE: {file_path} ({total} lines{truncated}) ===\n{content}"
 
-    # Large file — return ±HUNK_CONTEXT_LINES around each hunk
+    # For diff file — full if small, context if large
+    if total <= MAX_FULL_FILE_LINES:
+        return f"=== FULL FILE: {file_path} ({total} lines) ===\n{''.join(lines)}"
+
     segments = []
     covered: set[int] = set()
-
     for hunk in hunks:
         lo = max(0, hunk["start"] - HUNK_CONTEXT_LINES - 1)
-        hi = min(total_lines, hunk["end"] + HUNK_CONTEXT_LINES)
-        seg_lines = []
+        hi = min(total, hunk["end"] + HUNK_CONTEXT_LINES)
+        seg = []
         for i in range(lo, hi):
             if i not in covered:
-                seg_lines.append(f"{i+1:4d} | {lines[i]}")
+                seg.append(f"{i+1:4d} | {lines[i]}")
                 covered.add(i)
-        if seg_lines:
-            segments.append(
-                f"--- {file_path} lines {lo+1}–{hi} ---\n" + "".join(seg_lines)
-            )
+        if seg:
+            segments.append(f"--- {file_path} lines {lo+1}–{hi} ---\n" + "".join(seg))
 
     if not segments:
         return None
 
     return (
-        f"=== CONTEXT: {file_path} ({total_lines} lines total, "
+        f"=== CONTEXT: {file_path} ({total} lines total, "
         f"showing {len(covered)} lines around changes) ===\n"
         + "\n".join(segments)
     )
 
 
 # ---------------------------------------------------------------------------
-# RAG — find similar past comments
+# RAG
 # ---------------------------------------------------------------------------
 
 def search_similar_comments(
@@ -177,114 +162,221 @@ def search_similar_comments(
     collection: chromadb.Collection,
     top_n: int = TOP_N_COMMENTS,
 ) -> list[dict]:
-    response = openai_client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=diff_chunk[:6000],
-    )
-    diff_vector = response.data[0].embedding
+    r = openai_client.embeddings.create(model=EMBEDDING_MODEL, input=diff_chunk[:6000])
+    vec = r.data[0].embedding
 
     results = collection.query(
-        query_embeddings=[diff_vector],
+        query_embeddings=[vec],
         n_results=min(top_n, collection.count()),
         include=["metadatas", "distances"],
     )
 
     comments = []
-    seen_bodies: set[str] = set()
-
-    for metadata, distance in zip(results["metadatas"][0], results["distances"][0]):
-        similarity = 1 - distance
-        if similarity < MIN_SIMILARITY:
+    seen: set[str] = set()
+    for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
+        if 1 - dist < MIN_SIMILARITY:
             continue
-        body = metadata.get("body", "").strip()
-        # Dedup identical comments
+        body = meta.get("body", "").strip()
         key = body[:100]
-        if key in seen_bodies:
+        if key in seen:
             continue
-        seen_bodies.add(key)
-        comments.append({
-            "file": metadata.get("file", ""),
-            "body": body,
-            "similarity": round(similarity, 3),
-        })
+        seen.add(key)
+        comments.append({"file": meta.get("file", ""), "body": body})
 
     return comments
 
 
 # ---------------------------------------------------------------------------
-# Prompt
+# Prompts
 # ---------------------------------------------------------------------------
 
-def build_prompt(
+def build_initial_prompt(
     file_path: str,
-    diff_chunk: str,
+    diff: str,
     file_context: str | None,
     similar_comments: list[dict],
+    extra_files: dict[str, str],
 ) -> str:
-    comments_text = ""
-    for comment in similar_comments:
-        comments_text += f"- [{comment['file']}] {comment['body']}\n"
+    comments_text = "\n".join(
+        f"- [{c['file']}] {c['body']}" for c in similar_comments
+    ) or "No similar past comments found."
 
     context_section = ""
     if file_context:
-        context_section = f"""
---- FULL FILE CONTEXT (use this to verify your findings) ---
-{file_context}
---- END FILE CONTEXT ---
-"""
+        context_section = f"\n--- PRIMARY FILE CONTEXT ---\n{file_context}\n--- END ---\n"
+
+    extra_section = ""
+    if extra_files:
+        parts = [f"\n--- ADDITIONAL FILE: {path} ---\n{content}\n--- END ---"
+                 for path, content in extra_files.items()]
+        extra_section = "\n".join(parts)
 
     return f"""You are a senior code reviewer doing a pre-PR review.
 
-You have access to:
-1. The git diff for this file
-2. The full file context (or relevant lines) so you can verify findings
-3. Past review comments from this team on similar code
+STRICT SEVERITY RULES:
+- "critical": real bug / data loss / crash / security. ONLY with confidence "high" AND evidence from the full file context. NEVER if the issue depends on logic in another file you haven't seen.
+- "important": wrong pattern, missing type safety, performance issue, missing error handling
+- "minor": style, naming, missing comment, small improvement. This includes: "add a comment", "rename variable", "test structure", "extract constant", "add TODO"
+- If you cannot see the full function — do NOT mark CRITICAL. Request the file instead.
+- If a guard/null-check exists elsewhere in the same file — do NOT flag it as missing.
+- Do NOT invent references to past comments. Only use what is provided below.
 
-IMPORTANT RULES:
-- CRITICAL severity requires evidence from the FULL FILE CONTEXT, not just the diff hunk
-- If you cannot see the full function in the diff — check the file context before marking CRITICAL
-- Do NOT invent references to past comments — only use the ones provided below
-- Do NOT flag intentional design decisions as bugs without evidence
-- If the guard/check exists elsewhere in the file, do NOT flag it as missing
+PAST TEAM COMMENTS (style guidance only):
+{comments_text}
 
---- PAST TEAM REVIEW COMMENTS (use as style guidance only) ---
-{comments_text if comments_text else "No similar past comments found."}
---- END PAST COMMENTS ---
+DIFF TO REVIEW:
+{diff}
+{context_section}{extra_section}
 
---- DIFF ---
-{diff_chunk}
---- END DIFF ---
-{context_section}
+If you need to see another file to verify a potential CRITICAL finding, respond with:
+{{"action": "need_files", "files": ["path/to/file.ts", "path/to/other.kt"], "reason": "why you need them"}}
 
-Respond with a JSON array of findings. Each finding:
-{{
-  "severity": "critical" | "important" | "minor",
-  "confidence": "high" | "medium" | "low",
-  "file": "filename.ts",
-  "line": "approximate line number or range",
-  "title": "short title",
-  "problem": "what is wrong and why it matters",
-  "fix": "how to fix it (code snippet if helpful)",
-  "evidence": "exact quote from full file context that confirms this issue exists"
-}}
+Otherwise respond with a JSON array of findings:
+[
+  {{
+    "severity": "critical" | "important" | "minor",
+    "confidence": "high" | "medium" | "low",
+    "file": "{file_path}",
+    "line": "line number or range",
+    "title": "short title",
+    "problem": "what is wrong and why it matters",
+    "fix": "how to fix it, code snippet if helpful",
+    "evidence": "exact quote from file context confirming the issue"
+  }}
+]
 
-Rules:
-- "critical": real bug, data loss, crash, security issue — only with confidence "high" and evidence from full file
-- "important": wrong pattern, missing type safety, performance issue
-- "minor": style, naming, missing comment, small improvement
-- If no issues found: return empty array []
-- Return ONLY the JSON array, no other text"""
+Return ONLY valid JSON — either the need_files object or the findings array. No other text."""
+
+
+def build_followup_prompt(reason: str, extra_files: dict[str, str]) -> str:
+    parts = [f"\n--- FILE: {path} ---\n{content}\n--- END ---"
+             for path, content in extra_files.items()]
+    files_text = "\n".join(parts)
+
+    return f"""You requested these files to verify your findings: {reason}
+
+{files_text}
+
+Now provide your final review as a JSON array of findings.
+Apply the same STRICT SEVERITY RULES as before.
+Return ONLY the JSON array, no other text."""
 
 
 # ---------------------------------------------------------------------------
-# Dedup findings across chunks
+# Agentic review loop
+# ---------------------------------------------------------------------------
+
+def agentic_review_file(
+    file_path: str,
+    file_diff: str,
+    file_context: str | None,
+    similar_comments: list[dict],
+    repo_root: str,
+    claude_client: anthropic.Anthropic,
+) -> list[dict]:
+    """
+    Review a single file with agentic file lookup.
+    Claude can request up to MAX_LOOKUP_FILES extra files before giving final answer.
+    """
+    extra_files: dict[str, str] = {}
+    fetched_files: set[str] = set()
+    messages = []
+
+    # Round 1 — initial review
+    initial_prompt = build_initial_prompt(
+        file_path, file_diff, file_context, similar_comments, extra_files
+    )
+    messages.append({"role": "user", "content": initial_prompt})
+
+    for round_num in range(1, MAX_LOOKUP_ROUNDS + 1):
+        response = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=3000,
+            messages=messages,
+        )
+        raw = response.content[0].text.strip()
+
+        # Strip code fences
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            print(f"  ⚠️  Could not parse JSON (round {round_num}): {raw[:150]}")
+            return []
+
+        # Claude wants more files
+        if isinstance(parsed, dict) and parsed.get("action") == "need_files":
+            requested = parsed.get("files", [])
+            reason = parsed.get("reason", "")
+
+            if round_num >= MAX_LOOKUP_ROUNDS:
+                print(f"  ⚠️  Max lookup rounds reached, proceeding without extra files")
+                # Force final answer
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user",
+                    "content": "Max file lookups reached. Give your best final review now as a JSON array. If you cannot confirm a CRITICAL finding without the missing files, downgrade it to important."
+                })
+                continue
+
+            # Read requested files
+            newly_fetched: dict[str, str] = {}
+            for req_path in requested[:MAX_LOOKUP_FILES]:
+                if req_path in fetched_files:
+                    continue
+                # Normalize path — strip leading /
+                clean_path = req_path.lstrip("/")
+                content = read_file(clean_path, repo_root, hunks=None)
+                if content:
+                    newly_fetched[clean_path] = content
+                    fetched_files.add(req_path)
+                    print(f"  🔍 Fetched: {clean_path}")
+                else:
+                    print(f"  ❌ Not found: {clean_path}")
+
+            if not newly_fetched:
+                # Nothing found — force final answer
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user",
+                    "content": "The requested files were not found in the repo. Give your final review as a JSON array without them. Downgrade any unverified CRITICAL to important."
+                })
+                continue
+
+            extra_files.update(newly_fetched)
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({
+                "role": "user",
+                "content": build_followup_prompt(reason, newly_fetched),
+            })
+            continue
+
+        # Claude returned findings array
+        if isinstance(parsed, list):
+            # Downgrade low-confidence criticals
+            for f in parsed:
+                if f.get("severity") == "critical" and f.get("confidence") != "high":
+                    f["severity"] = "important"
+                    f["title"] = f.get("title", "") + " (downgraded: unverified)"
+            lookup_count = len(fetched_files)
+            if lookup_count:
+                print(f"  🔍 Used {lookup_count} extra file(s) for verification")
+            return parsed
+
+        print(f"  ⚠️  Unexpected response shape: {str(parsed)[:100]}")
+        return []
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Dedup
 # ---------------------------------------------------------------------------
 
 def dedup_findings(findings: list[dict]) -> list[dict]:
-    """
-    Remove duplicate findings across chunks.
-    Two findings are duplicates if same file + very similar title.
-    """
     seen: set[str] = set()
     result = []
     for f in findings:
@@ -299,12 +391,7 @@ def dedup_findings(findings: list[dict]) -> list[dict]:
 # Markdown rendering
 # ---------------------------------------------------------------------------
 
-SEVERITY_EMOJI = {
-    "critical": "🔴",
-    "important": "🟠",
-    "minor": "🟢",
-}
-
+SEVERITY_EMOJI = {"critical": "🔴", "important": "🟠", "minor": "🟢"}
 SEVERITY_ORDER = {"critical": 0, "important": 1, "minor": 2}
 CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -320,12 +407,9 @@ def findings_to_markdown(
             f"# Code Review\n"
             f"**Branch:** `{current_branch}` → `{base_branch}`\n"
             f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-            f"**Diff size:** {diff_lines} lines\n\n"
-            f"---\n\n"
-            f"✅ No issues found.\n"
+            f"**Diff size:** {diff_lines} lines\n\n---\n\n✅ No issues found.\n"
         )
 
-    # Sort: severity → confidence
     sorted_findings = sorted(
         findings,
         key=lambda f: (
@@ -334,83 +418,67 @@ def findings_to_markdown(
         ),
     )
 
-    # Group by file
     by_file: dict[str, list[dict]] = {}
     for f in sorted_findings:
-        file_key = f.get("file", "unknown")
-        by_file.setdefault(file_key, []).append(f)
+        by_file.setdefault(f.get("file", "unknown"), []).append(f)
 
-    # Summary counts
-    critical = sum(1 for f in sorted_findings if f.get("severity") == "critical")
+    critical  = sum(1 for f in sorted_findings if f.get("severity") == "critical")
     important = sum(1 for f in sorted_findings if f.get("severity") == "important")
-    minor = sum(1 for f in sorted_findings if f.get("severity") == "minor")
+    minor     = sum(1 for f in sorted_findings if f.get("severity") == "minor")
 
     lines = [
-        f"# Code Review",
+        "# Code Review",
         f"**Branch:** `{current_branch}` → `{base_branch}`",
         f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"**Diff size:** {diff_lines} lines",
         f"**Findings:** 🔴 {critical} critical · 🟠 {important} important · 🟢 {minor} minor",
-        "",
-        "---",
-        "",
+        "", "---", "",
     ]
 
     for file_path, file_findings in by_file.items():
         lines.append(f"## `{file_path}`")
         lines.append("")
-
         for f in file_findings:
-            severity = f.get("severity", "minor")
+            severity   = f.get("severity", "minor")
             confidence = f.get("confidence", "low")
-            emoji = SEVERITY_EMOJI.get(severity, "🟢")
-            label = severity.upper()
-            conf_note = f" _(confidence: {confidence})_" if confidence != "high" else ""
+            emoji      = SEVERITY_EMOJI.get(severity, "🟢")
+            conf_note  = f" _(confidence: {confidence})_" if confidence != "high" else ""
 
-            lines.append(f"### {emoji} {label} — {f.get('title', 'Issue')}{conf_note}")
+            lines.append(f"### {emoji} {severity.upper()} — {f.get('title', 'Issue')}{conf_note}")
             lines.append("")
-
             if f.get("line"):
                 lines.append(f"**Line:** {f['line']}")
                 lines.append("")
-
             lines.append(f"**Problem:** {f.get('problem', '')}")
             lines.append("")
-
             if f.get("fix"):
-                lines.append(f"**Fix:**")
-                lines.append(f"```")
+                lines.append("**Fix:**")
+                lines.append("```")
                 lines.append(f.get("fix", ""))
-                lines.append(f"```")
+                lines.append("```")
                 lines.append("")
-
-            if f.get("evidence") and confidence != "high":
+            if f.get("evidence"):
                 lines.append(f"**Evidence:** _{f.get('evidence', '')}_")
                 lines.append("")
-
             lines.append("---")
             lines.append("")
 
-    # Summary section
-    lines.append("## Summary")
-    lines.append("")
-    if critical > 0:
-        lines.append(f"🔴 **{critical} critical issue(s)** — must fix before merge.")
-    if important > 0:
-        lines.append(f"🟠 **{important} important issue(s)** — should fix before merge.")
-    if minor > 0:
-        lines.append(f"🟢 **{minor} minor issue(s)** — consider fixing for code quality.")
-    lines.append("")
-    lines.append(
-        "> ⚠️ Always verify CRITICAL findings manually. "
-        "Reviewer has full file context but may miss product intent from PR description."
-    )
+    lines += [
+        "## Summary",
+        "",
+        f"🔴 **{critical} critical** — must fix before merge." if critical else "",
+        f"🟠 **{important} important** — should fix before merge." if important else "",
+        f"🟢 **{minor} minor** — consider fixing for code quality." if minor else "",
+        "",
+        "> ⚠️ Always verify CRITICAL findings manually.",
+        "> Reviewer reads full file context + dependency files, but may miss product intent.",
+    ]
 
-    return "\n".join(lines)
+    return "\n".join(l for l in lines)
 
 
 # ---------------------------------------------------------------------------
-# Main review flow
+# Main
 # ---------------------------------------------------------------------------
 
 def review_diff(
@@ -418,135 +486,86 @@ def review_diff(
     db_path: str = "db/chroma",
     top_n: int = TOP_N_COMMENTS,
 ) -> None:
-    openai_key = os.getenv("OPENAI_API_KEY")
+    openai_key    = os.getenv("OPENAI_API_KEY")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
     if not openai_key:
         raise ValueError("OPENAI_API_KEY not found in .env")
     if not anthropic_key:
         raise ValueError("ANTHROPIC_API_KEY not found in .env")
-
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database not found at '{db_path}'. Run embed.py first.")
 
     current_branch = get_current_branch()
-    repo_root = get_repo_root()
+    repo_root      = get_repo_root()
 
     print(f"Branch:    {current_branch}")
     print(f"Base:      {base_branch}")
     print(f"Repo root: {repo_root}")
     print(f"Diffing {base_branch}...{current_branch}\n")
 
-    diff = get_diff(base_branch, current_branch)
+    diff       = get_diff(base_branch, current_branch)
     diff_lines = diff.count("\n")
-    print(f"Diff size: {diff_lines} lines")
-
     file_diffs = parse_diff_by_file(diff)
+
+    print(f"Diff size:     {diff_lines} lines")
     print(f"Changed files: {len(file_diffs)}")
 
     chroma_client = chromadb.PersistentClient(path=db_path)
-    collection = chroma_client.get_collection(name=COLLECTION_NAME)
+    collection    = chroma_client.get_collection(name=COLLECTION_NAME)
     print(f"Knowledge base: {collection.count()} comments\n")
 
     openai_client = OpenAI(api_key=openai_key)
     claude_client = anthropic.Anthropic(api_key=anthropic_key)
 
+    SKIP_EXTENSIONS = {".lock", ".png", ".jpg", ".jpeg", ".gif", ".ico"}
     all_findings: list[dict] = []
 
-    for i, file_entry in enumerate(file_diffs, 1):
-        file_path = file_entry["file"]
-        file_diff = file_entry["diff"]
-        hunks = file_entry["hunks"]
+    for i, entry in enumerate(file_diffs, 1):
+        file_path = entry["file"]
+        file_diff = entry["diff"]
+        hunks     = entry["hunks"]
 
-        print(f"[{i}/{len(file_diffs)}] {file_path} ({len(hunks)} hunk(s))")
+        print(f"[{i}/{len(file_diffs)}] {file_path}")
 
-        # Skip binary / lock files
-        skip_extensions = {".lock", ".pbxproj", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico"}
-        if any(file_path.endswith(ext) for ext in skip_extensions):
-            # Still include pbxproj in review but skip context reading
-            if file_path.endswith(".lock"):
-                print("  Skipping lock file")
-                continue
+        if any(file_path.endswith(ext) for ext in SKIP_EXTENSIONS):
+            print("  Skipped (binary/lock)")
+            continue
 
-        # Read full file context
-        file_context = read_file_context(file_path, hunks, repo_root)
-        if file_context:
-            context_lines = file_context.count("\n")
-            print(f"  File context: {context_lines} lines")
-        else:
-            print(f"  File context: not available (deleted or binary)")
+        file_context = read_file(file_path, repo_root, hunks)
+        ctx_info = f"{file_context.count(chr(10))} lines" if file_context else "not available"
+        print(f"  Context: {ctx_info}")
 
-        # Find similar past comments
-        similar_comments = search_similar_comments(file_diff, openai_client, collection, top_n)
-        print(f"  Similar past comments: {len(similar_comments)}")
+        similar = search_similar_comments(file_diff, openai_client, collection, top_n)
+        print(f"  Past comments: {len(similar)}")
 
-        # Build prompt and call Claude
-        prompt = build_prompt(file_path, file_diff, file_context, similar_comments)
+        findings = agentic_review_file(
+            file_path, file_diff, file_context, similar, repo_root, claude_client
+        )
+        print(f"  Findings: {len(findings)}")
+        all_findings.extend(findings)
 
-        try:
-            response = claude_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=3000,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = response.content[0].text.strip()
-
-            # Strip markdown code fences if Claude wrapped the JSON
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\n?", "", raw)
-                raw = re.sub(r"\n?```$", "", raw)
-
-            findings = json.loads(raw)
-            if isinstance(findings, list):
-                # Downgrade low-confidence criticals to important
-                for f in findings:
-                    if f.get("severity") == "critical" and f.get("confidence") != "high":
-                        f["severity"] = "important"
-                        f["title"] = f.get("title", "") + " (downgraded: low confidence)"
-                all_findings.extend(findings)
-                print(f"  Findings: {len(findings)}")
-            else:
-                print(f"  Unexpected response format, skipping")
-
-        except json.JSONDecodeError as e:
-            print(f"  Could not parse JSON response: {e}")
-            print(f"  Raw response: {raw[:200]}")
-        except Exception as e:
-            print(f"  Error reviewing {file_path}: {e}")
-
-    # Dedup across all files
     deduped = dedup_findings(all_findings)
     removed = len(all_findings) - len(deduped)
     if removed:
-        print(f"\nDeduped {removed} duplicate finding(s)")
+        print(f"\nDeduped {removed} duplicate(s)")
 
-    # Render markdown
-    markdown = findings_to_markdown(deduped, current_branch, base_branch, diff_lines)
-
-    # Save to file
+    markdown  = findings_to_markdown(deduped, current_branch, base_branch, diff_lines)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    output_filename = f"review_{timestamp}.md"
+    output    = f"review_{timestamp}.md"
 
-    with open(output_filename, "w", encoding="utf-8") as f:
+    with open(output, "w", encoding="utf-8") as f:
         f.write(markdown)
 
-    print(f"\n✅ Review saved to: {output_filename}")
-    print(f"   {len(deduped)} findings total\n")
-    print(markdown)
+    print(f"\n✅ Review saved to: {output}")
+    print(f"   {len(deduped)} findings ({sum(1 for f in deduped if f.get('severity')=='critical')} critical)\n")
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="AI code reviewer based on your team's PR history"
-    )
-    parser.add_argument("--base", default="main", help="Base branch to diff against (default: main)")
-    parser.add_argument("--db", default="db/chroma", help="ChromaDB path (default: db/chroma)")
-    parser.add_argument("--top", type=int, default=TOP_N_COMMENTS, help="Past comments to retrieve per file")
-
+    parser = argparse.ArgumentParser(description="AI code reviewer with agentic file lookup")
+    parser.add_argument("--base", default="main")
+    parser.add_argument("--db",   default="db/chroma")
+    parser.add_argument("--top",  type=int, default=TOP_N_COMMENTS)
     args = parser.parse_args()
     review_diff(base_branch=args.base, db_path=args.db, top_n=args.top)
 
