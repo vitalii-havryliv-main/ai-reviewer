@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import chromadb
 import anthropic
-
 load_dotenv()
 
 EMBEDDING_MODEL  = "text-embedding-3-small"
@@ -66,6 +65,102 @@ def get_diff(base_branch: str, current_branch: str) -> str:
 def get_repo_root() -> str:
     r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     return r.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Project config
+# ---------------------------------------------------------------------------
+
+def load_project_config(config_path: str | None) -> dict:
+    """Load project.json config if provided. Returns empty dict if not."""
+    if not config_path:
+        return {}
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Project config not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_always_include_files(
+    file_path: str,
+    project_config: dict,
+    repo_root: str,
+) -> dict[str, str]:
+    """
+    Auto-load files defined in always_include when diff file matches a pattern.
+    """
+    always_include = project_config.get("always_include", [])
+    extra: dict[str, str] = {}
+
+    for rule in always_include:
+        pattern = rule.get("pattern", "")
+        if not pattern:
+            continue
+        if re.search(pattern, file_path, re.IGNORECASE):
+            for inc_path in rule.get("files", []):
+                if inc_path not in extra:
+                    content = read_file(inc_path, repo_root, hunks=None)
+                    if content:
+                        extra[inc_path] = content
+
+    return extra
+
+
+def resolve_import_path(raw_path: str, project_config: dict) -> str:
+    """Resolve import alias to real path using project config."""
+    aliases = project_config.get("import_aliases", {})
+    for alias, real in aliases.items():
+        if raw_path.startswith(alias):
+            return raw_path.replace(alias, real, 1)
+    return raw_path
+
+
+def build_project_context_section(project_config: dict) -> str:
+    """Build project context string to inject into prompt."""
+    if not project_config:
+        return ""
+
+    parts = []
+
+    name = project_config.get("name", "")
+    if name:
+        parts.append(f"Project: {name}")
+
+    stack = project_config.get("stack", {})
+    if stack:
+        langs = ", ".join(stack.get("languages", []))
+        frameworks = ", ".join(stack.get("frameworks", []))
+        libs = stack.get("key_libs", [])
+        if langs:
+            parts.append(f"Languages: {langs}")
+        if frameworks:
+            parts.append(f"Frameworks: {frameworks}")
+        if libs:
+            parts.append("Key libraries:")
+            for lib in libs:
+                parts.append(f"  - {lib}")
+
+    structure = project_config.get("structure", "")
+    if structure:
+        parts.append("\nProject structure:\n" + structure.strip())
+
+    intentional = project_config.get("intentional_patterns", "")
+    if intentional:
+        parts.append("\nINTENTIONAL PATTERNS (do NOT flag these as bugs):\n" + intentional.strip())
+
+    rules = project_config.get("review_rules", "")
+    if rules:
+        parts.append("\nPROJECT REVIEW RULES (apply these as priorities):\n" + rules.strip())
+
+    additional = project_config.get("additional_context", "")
+    if additional:
+        parts.append("\nADDITIONAL PROJECT CONTEXT:\n" + additional.strip())
+
+    if not parts:
+        return ""
+
+    return "--- PROJECT CONTEXT ---\n" + "\n".join(parts) + "\n--- END PROJECT CONTEXT ---"
+
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +291,7 @@ def build_initial_prompt(
     file_context: str | None,
     similar_comments: list[dict],
     extra_files: dict[str, str],
+    project_context: str = "",
 ) -> str:
     comments_text = "\n".join(
         f"- [{c['file']}] {c['body']}" for c in similar_comments
@@ -211,8 +307,10 @@ def build_initial_prompt(
                  for path, content in extra_files.items()]
         extra_section = "\n".join(parts)
 
-    return f"""You are a senior code reviewer doing a pre-PR review.
+    project_section = ("\n" + project_context + "\n") if project_context else ""
 
+    return f"""You are a senior code reviewer doing a pre-PR review.
+{project_section}
 STRICT SEVERITY RULES:
 - "critical": real bug / data loss / crash / security. ONLY with confidence "high" AND evidence from the full file context. NEVER if the issue depends on logic in another file you haven't seen.
 - "important": wrong pattern, missing type safety, performance issue, missing error handling
@@ -273,6 +371,8 @@ def agentic_review_file(
     similar_comments: list[dict],
     repo_root: str,
     claude_client: anthropic.Anthropic,
+    project_context: str = "",
+    project_config: dict | None = None,
 ) -> list[dict]:
     """
     Review a single file with agentic file lookup.
@@ -284,7 +384,8 @@ def agentic_review_file(
 
     # Round 1 — initial review
     initial_prompt = build_initial_prompt(
-        file_path, file_diff, file_context, similar_comments, extra_files
+        file_path, file_diff, file_context, similar_comments, extra_files,
+        project_context=project_context,
     )
     messages.append({"role": "user", "content": initial_prompt})
 
@@ -329,6 +430,9 @@ def agentic_review_file(
                     continue
                 # Normalize path — strip leading /
                 clean_path = req_path.lstrip("/")
+                # Resolve import aliases if project config provided
+                if project_config:
+                    clean_path = resolve_import_path(clean_path, project_config)
                 content = read_file(clean_path, repo_root, hunks=None)
                 if content:
                     newly_fetched[clean_path] = content
@@ -485,6 +589,7 @@ def review_diff(
     base_branch: str = "main",
     db_path: str = "db/chroma",
     top_n: int = TOP_N_COMMENTS,
+    project_config_path: str | None = None,
 ) -> None:
     openai_key    = os.getenv("OPENAI_API_KEY")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
@@ -495,6 +600,10 @@ def review_diff(
         raise ValueError("ANTHROPIC_API_KEY not found in .env")
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database not found at '{db_path}'. Run embed.py first.")
+
+    project_config = load_project_config(project_config_path)
+    if project_config:
+        print(f"Project config: {project_config.get('name', project_config_path)}")
 
     current_branch = get_current_branch()
     repo_root      = get_repo_root()
@@ -519,6 +628,7 @@ def review_diff(
     claude_client = anthropic.Anthropic(api_key=anthropic_key)
 
     SKIP_EXTENSIONS = {".lock", ".png", ".jpg", ".jpeg", ".gif", ".ico"}
+    project_context = build_project_context_section(project_config)
     all_findings: list[dict] = []
 
     for i, entry in enumerate(file_diffs, 1):
@@ -539,8 +649,15 @@ def review_diff(
         similar = search_similar_comments(file_diff, openai_client, collection, top_n)
         print(f"  Past comments: {len(similar)}")
 
+        # Auto-load always_include files from project config
+        auto_files = get_always_include_files(file_path, project_config, repo_root)
+        if auto_files:
+            print(f"  Auto-included: {list(auto_files.keys())}")
+
         findings = agentic_review_file(
-            file_path, file_diff, file_context, similar, repo_root, claude_client
+            file_path, file_diff, file_context, similar, repo_root, claude_client,
+            project_context=project_context,
+            project_config=project_config,
         )
         print(f"  Findings: {len(findings)}")
         all_findings.extend(findings)
@@ -565,9 +682,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AI code reviewer with agentic file lookup")
     parser.add_argument("--base", default="main")
     parser.add_argument("--db",   default="db/chroma")
-    parser.add_argument("--top",  type=int, default=TOP_N_COMMENTS)
+    parser.add_argument("--top",     type=int, default=TOP_N_COMMENTS)
+    parser.add_argument("--project",  default=None, help="Path to project config yml (e.g. projects/un1q.yml)")
     args = parser.parse_args()
-    review_diff(base_branch=args.base, db_path=args.db, top_n=args.top)
+    review_diff(base_branch=args.base, db_path=args.db, top_n=args.top, project_config_path=args.project)
 
 
 if __name__ == "__main__":

@@ -104,7 +104,7 @@ def embed_comments(
         print(f"  Batch {batch_idx + 1}/{total_batches} ({len(batch)} comments)...")
 
         # Build texts for embedding
-        texts = [build_text(c) for c in batch]
+        texts = [build_text(c)[:6000] for c in batch]
         ids = [str(c["id"]) for c in batch]
         metadatas = [
             {
