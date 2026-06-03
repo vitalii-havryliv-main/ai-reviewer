@@ -679,11 +679,15 @@ def review_diff(
 
 
 def main() -> None:
+    # Read defaults from .env if set
+    default_db      = os.getenv("AI_REVIEWER_DB", "db/chroma")
+    default_project = os.getenv("AI_REVIEWER_PROJECT", None)
+
     parser = argparse.ArgumentParser(description="AI code reviewer with agentic file lookup")
-    parser.add_argument("--base", default="main")
-    parser.add_argument("--db",   default="db/chroma")
+    parser.add_argument("--base",    default="main", help="Base branch to diff against (default: main)")
+    parser.add_argument("--db",      default=default_db, help="ChromaDB path (default: AI_REVIEWER_DB or db/chroma)")
     parser.add_argument("--top",     type=int, default=TOP_N_COMMENTS)
-    parser.add_argument("--project",  default=None, help="Path to project config yml (e.g. projects/un1q.yml)")
+    parser.add_argument("--project", default=default_project, help="Path to project config json (default: AI_REVIEWER_PROJECT)")
     args = parser.parse_args()
     review_diff(base_branch=args.base, db_path=args.db, top_n=args.top, project_config_path=args.project)
 
