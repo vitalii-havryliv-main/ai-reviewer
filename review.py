@@ -13,10 +13,14 @@ Setup:
 """
 
 import os
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")  # silence chromadb/posthog telemetry noise
+
 import re
 import json
+import time
 import argparse
 import subprocess
+from collections import deque
 from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -32,8 +36,22 @@ HUNK_CONTEXT_LINES  = 100   # lines around each hunk for large files
 MAX_FULL_FILE_LINES = 300   # files smaller than this are included fully
 MIN_SIMILARITY      = 0.5   # RAG threshold
 TOP_N_COMMENTS      = 10    # past comments per file
-MAX_LOOKUP_ROUNDS   = 3     # max agentic file-lookup rounds per file
+MAX_LOOKUP_ROUNDS   = 2     # max agentic file-lookup rounds per file
 MAX_LOOKUP_FILES    = 5     # max extra files Claude can request per file
+MAX_RETRY_WAIT      = 120   # don't sleep longer than this on a 429 Retry-After
+# Per-minute input-token rate limit (your API tier). Override via AI_REVIEWER_ITPM.
+# We pace requests proactively to stay under this instead of bursting and getting 429s.
+ITPM_LIMIT          = int(os.getenv("AI_REVIEWER_ITPM", "30000"))
+
+# Generated / non-reviewable files: skip them entirely. Reviewing them is useless
+# and a single one (e.g. a minified .tsbuildinfo on one giant line) can be 150k+
+# tokens and blow the whole rate-limit budget by itself.
+SKIP_EXTENSIONS     = {".lock", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+                       ".tsbuildinfo", ".map", ".snap", ".min.js", ".min.css"}
+SKIP_FILENAMES      = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                       "composer.lock", "Gemfile.lock", "poetry.lock", "Cargo.lock"}
+# Catch-all: any file whose diff is this big is almost certainly generated.
+MAX_DIFF_TOKENS     = 30000
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +93,7 @@ def load_project_config(config_path: str | None) -> dict:
     """Load project.json config if provided. Returns empty dict if not."""
     if not config_path:
         return {}
+    config_path = os.path.expanduser(config_path)
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Project config not found: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
@@ -285,13 +304,49 @@ def search_similar_comments(
 # Prompts
 # ---------------------------------------------------------------------------
 
+def build_system_prompt(project_context: str = "") -> str:
+    """
+    Static instructions shared by every file and every agentic round.
+    Kept identical across requests so it can be served from the prompt cache.
+    """
+    project_section = ("\n" + project_context + "\n") if project_context else ""
+
+    return f"""You are a senior code reviewer doing a pre-PR review.
+{project_section}
+STRICT SEVERITY RULES:
+- "critical": real bug / data loss / crash / security. ONLY with confidence "high" AND evidence from the full file context. NEVER if the issue depends on logic in another file you haven't seen.
+- "important": wrong pattern, missing type safety, performance issue, missing error handling
+- "minor": style, naming, missing comment, small improvement. This includes: "add a comment", "rename variable", "test structure", "extract constant", "add TODO"
+- If you cannot see the full function — do NOT mark CRITICAL. Request the file instead.
+- If a guard/null-check exists elsewhere in the same file — do NOT flag it as missing.
+- Do NOT invent references to past comments. Only use what is provided.
+
+If you need to see another file to verify a potential CRITICAL finding, respond with:
+{{"action": "need_files", "files": ["path/to/file.ts", "path/to/other.kt"], "reason": "why you need them"}}
+
+Otherwise respond with a JSON array of findings:
+[
+  {{
+    "severity": "critical" | "important" | "minor",
+    "confidence": "high" | "medium" | "low",
+    "file": "the file path under review",
+    "line": "line number or range",
+    "title": "short title",
+    "problem": "what is wrong and why it matters",
+    "fix": "how to fix it, code snippet if helpful",
+    "evidence": "exact quote from file context confirming the issue"
+  }}
+]
+
+Return ONLY valid JSON — either the need_files object or the findings array. No other text."""
+
+
 def build_initial_prompt(
     file_path: str,
     diff: str,
     file_context: str | None,
     similar_comments: list[dict],
     extra_files: dict[str, str],
-    project_context: str = "",
 ) -> str:
     comments_text = "\n".join(
         f"- [{c['file']}] {c['body']}" for c in similar_comments
@@ -307,17 +362,7 @@ def build_initial_prompt(
                  for path, content in extra_files.items()]
         extra_section = "\n".join(parts)
 
-    project_section = ("\n" + project_context + "\n") if project_context else ""
-
-    return f"""You are a senior code reviewer doing a pre-PR review.
-{project_section}
-STRICT SEVERITY RULES:
-- "critical": real bug / data loss / crash / security. ONLY with confidence "high" AND evidence from the full file context. NEVER if the issue depends on logic in another file you haven't seen.
-- "important": wrong pattern, missing type safety, performance issue, missing error handling
-- "minor": style, naming, missing comment, small improvement. This includes: "add a comment", "rename variable", "test structure", "extract constant", "add TODO"
-- If you cannot see the full function — do NOT mark CRITICAL. Request the file instead.
-- If a guard/null-check exists elsewhere in the same file — do NOT flag it as missing.
-- Do NOT invent references to past comments. Only use what is provided below.
+    return f"""Review this file: {file_path}
 
 PAST TEAM COMMENTS (style guidance only):
 {comments_text}
@@ -326,24 +371,7 @@ DIFF TO REVIEW:
 {diff}
 {context_section}{extra_section}
 
-If you need to see another file to verify a potential CRITICAL finding, respond with:
-{{"action": "need_files", "files": ["path/to/file.ts", "path/to/other.kt"], "reason": "why you need them"}}
-
-Otherwise respond with a JSON array of findings:
-[
-  {{
-    "severity": "critical" | "important" | "minor",
-    "confidence": "high" | "medium" | "low",
-    "file": "{file_path}",
-    "line": "line number or range",
-    "title": "short title",
-    "problem": "what is wrong and why it matters",
-    "fix": "how to fix it, code snippet if helpful",
-    "evidence": "exact quote from file context confirming the issue"
-  }}
-]
-
-Return ONLY valid JSON — either the need_files object or the findings array. No other text."""
+Apply the STRICT SEVERITY RULES and respond per the output format above."""
 
 
 def build_followup_prompt(reason: str, extra_files: dict[str, str]) -> str:
@@ -364,6 +392,109 @@ Return ONLY the JSON array, no other text."""
 # Agentic review loop
 # ---------------------------------------------------------------------------
 
+class TokenRateLimiter:
+    """
+    Proactively paces requests to stay under a per-minute input-token budget.
+
+    The API limit is 30k input tokens per *minute*, not per request. Firing
+    requests back-to-back blows past it instantly. Before each request we wait
+    until the tokens spent in the trailing 60s window leave room for the next
+    one. Cheaper and faster than bursting into 429s and waiting them out.
+    """
+
+    def __init__(self, limit: int, window: float = 60.0, safety: float = 0.9):
+        self.budget = max(1, int(limit * safety))  # margin below the hard limit
+        self.window = window
+        self.events: deque[tuple[float, int]] = deque()
+
+    def _used(self, now: float) -> int:
+        while self.events and now - self.events[0][0] > self.window:
+            self.events.popleft()
+        return sum(tok for _, tok in self.events)
+
+    def acquire(self, est_tokens: int) -> None:
+        while True:
+            now = time.monotonic()
+            used = self._used(now)
+            # If nothing is in flight we always proceed, even if a single request
+            # exceeds the budget — we can't split it, so let the server arbitrate.
+            if not self.events or used + est_tokens <= self.budget:
+                return
+            sleep_for = self.window - (now - self.events[0][0]) + 0.5
+            if sleep_for <= 0:
+                continue
+            print(f"  ⏳ Pacing: ~{used} tok used in last 60s, "
+                  f"waiting {sleep_for:.0f}s to stay under {self.budget}/min...")
+            time.sleep(sleep_for)
+
+    def record(self, tokens: int) -> None:
+        self.events.append((time.monotonic(), tokens))
+
+
+_RATE_LIMITER = TokenRateLimiter(ITPM_LIMIT)
+
+
+def _estimate_input_tokens(system, messages) -> int:
+    """Rough char/3 estimate of input tokens, used to pace before sending."""
+    chars = 0
+    for block in (system or []):
+        chars += len(block.get("text", ""))
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            chars += len(content)
+        else:
+            for block in content:
+                chars += len(block.get("text", "")) if isinstance(block, dict) else len(str(block))
+    return chars // 3  # conservative: ~3 chars/token, overestimates to pace safely
+
+
+def create_message_with_retry(
+    claude_client: anthropic.Anthropic,
+    max_attempts: int = 8,
+    **kwargs,
+):
+    """
+    Wrapper around messages.create that paces requests under the per-minute
+    token budget and waits out any residual 429 rate-limit errors.
+
+    Honors the Retry-After header when present; fails fast if the wait is huge
+    (a sign the requests are simply too big for the tier). Logs while waiting so
+    the run doesn't look hung.
+    """
+    est = _estimate_input_tokens(kwargs.get("system"), kwargs.get("messages", []))
+    for attempt in range(1, max_attempts + 1):
+        _RATE_LIMITER.acquire(est)
+        try:
+            response = claude_client.messages.create(**kwargs)
+            usage = response.usage
+            billed = (usage.input_tokens
+                      + getattr(usage, "cache_read_input_tokens", 0)
+                      + getattr(usage, "cache_creation_input_tokens", 0))
+            _RATE_LIMITER.record(billed)
+            return response
+        except anthropic.RateLimitError as err:
+            if attempt == max_attempts:
+                raise
+            retry_after = None
+            try:
+                retry_after = float(err.response.headers.get("retry-after"))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            wait = retry_after if retry_after is not None else min(60, 2 ** attempt)
+            # A huge Retry-After means we're hard-throttled — waiting 10+ min per
+            # request is pointless. Fail fast with actionable guidance instead.
+            if wait > MAX_RETRY_WAIT:
+                raise RuntimeError(
+                    f"Rate limited for {wait:.0f}s — your requests are too large for "
+                    f"the current per-minute token limit. Reduce prompt size "
+                    f"(MAX_LOOKUP_ROUNDS, project.json) or raise your API tier, then retry."
+                ) from err
+            print(f"  ⏳ Rate limited; waiting {wait:.0f}s "
+                  f"(attempt {attempt}/{max_attempts})...")
+            time.sleep(wait)
+
+
 def agentic_review_file(
     file_path: str,
     file_diff: str,
@@ -382,17 +513,26 @@ def agentic_review_file(
     fetched_files: set[str] = set()
     messages = []
 
+    # Static instructions go in a cached system prompt — identical for every file
+    # and every round, so after the first request they cost ~0 input tokens.
+    system = [{
+        "type": "text",
+        "text": build_system_prompt(project_context),
+        "cache_control": {"type": "ephemeral"},
+    }]
+
     # Round 1 — initial review
     initial_prompt = build_initial_prompt(
         file_path, file_diff, file_context, similar_comments, extra_files,
-        project_context=project_context,
     )
     messages.append({"role": "user", "content": initial_prompt})
 
     for round_num in range(1, MAX_LOOKUP_ROUNDS + 1):
-        response = claude_client.messages.create(
+        response = create_message_with_retry(
+            claude_client,
             model=CLAUDE_MODEL,
             max_tokens=3000,
+            system=system,
             messages=messages,
         )
         raw = response.content[0].text.strip()
@@ -598,6 +738,7 @@ def review_diff(
         raise ValueError("OPENAI_API_KEY not found in .env")
     if not anthropic_key:
         raise ValueError("ANTHROPIC_API_KEY not found in .env")
+    db_path = os.path.expanduser(db_path)
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database not found at '{db_path}'. Run embed.py first.")
 
@@ -620,14 +761,16 @@ def review_diff(
     print(f"Diff size:     {diff_lines} lines")
     print(f"Changed files: {len(file_diffs)}")
 
-    chroma_client = chromadb.PersistentClient(path=db_path)
+    chroma_client = chromadb.PersistentClient(
+        path=db_path,
+        settings=chromadb.Settings(anonymized_telemetry=False),
+    )
     collection    = chroma_client.get_collection(name=COLLECTION_NAME)
     print(f"Knowledge base: {collection.count()} comments\n")
 
     openai_client = OpenAI(api_key=openai_key)
-    claude_client = anthropic.Anthropic(api_key=anthropic_key)
+    claude_client = anthropic.Anthropic(api_key=anthropic_key, max_retries=4)
 
-    SKIP_EXTENSIONS = {".lock", ".png", ".jpg", ".jpeg", ".gif", ".ico"}
     project_context = build_project_context_section(project_config)
     all_findings: list[dict] = []
 
@@ -638,8 +781,13 @@ def review_diff(
 
         print(f"[{i}/{len(file_diffs)}] {file_path}")
 
-        if any(file_path.endswith(ext) for ext in SKIP_EXTENSIONS):
-            print("  Skipped (binary/lock)")
+        basename = os.path.basename(file_path)
+        if any(file_path.endswith(ext) for ext in SKIP_EXTENSIONS) or basename in SKIP_FILENAMES:
+            print("  Skipped (generated/binary/lock)")
+            continue
+        diff_tokens = len(file_diff) // 3
+        if diff_tokens > MAX_DIFF_TOKENS:
+            print(f"  Skipped (~{diff_tokens} tok diff — looks generated, would blow rate limit)")
             continue
 
         file_context = read_file(file_path, repo_root, hunks)
