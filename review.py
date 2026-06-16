@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-review.py — AI code reviewer with agentic file lookup for cross-file verification
+review.py — fast first-pass code reviewer ("raven" mode + cross-file leads)
+
+Dumps broad candidate findings from the diff. It does NOT verify or rank by severity —
+that is delegated to a separate counter-review step. It MAY grep the repo once per file to
+surface cross-file inconsistency leads (the one thing the counter-review can't cheaply
+reproduce). Cheap and fast on purpose.
 
 Usage:
     python review.py
     python review.py --base 0.2.x
-    python review.py --base main --db db/chroma --top 10
+    python review.py --base main --project project.json
 
 Setup:
-    Make sure OPENAI_API_KEY and ANTHROPIC_API_KEY are in your .env file
-    Run collect.py and embed.py first to build the knowledge base
+    ANTHROPIC_API_KEY in your .env file.
 """
 
 import os
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")  # silence chromadb/posthog telemetry noise
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 import re
 import json
@@ -23,35 +27,22 @@ import subprocess
 from collections import deque
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import OpenAI
-import chromadb
 import anthropic
 load_dotenv()
 
-EMBEDDING_MODEL  = "text-embedding-3-small"
-COLLECTION_NAME  = "pr_reviews"
-CLAUDE_MODEL     = "claude-sonnet-4-6"
+CLAUDE_MODEL    = "claude-sonnet-4-6"
+MAX_RETRY_WAIT  = 120
+MAX_LEAD_ROUNDS = 2     # at most one grep round, then a forced submit
+GREP_MAX_LINES  = 40    # cap git-grep output per pattern
+# Per-minute input-token budget (your API tier). Override via AI_REVIEWER_ITPM.
+ITPM_LIMIT      = int(os.getenv("AI_REVIEWER_ITPM", "2000000"))
 
-HUNK_CONTEXT_LINES  = 100   # lines around each hunk for large files
-MAX_FULL_FILE_LINES = 300   # files smaller than this are included fully
-MIN_SIMILARITY      = 0.5   # RAG threshold
-TOP_N_COMMENTS      = 10    # past comments per file
-MAX_LOOKUP_ROUNDS   = 2     # max agentic file-lookup rounds per file
-MAX_LOOKUP_FILES    = 5     # max extra files Claude can request per file
-MAX_RETRY_WAIT      = 120   # don't sleep longer than this on a 429 Retry-After
-# Per-minute input-token rate limit (your API tier). Override via AI_REVIEWER_ITPM.
-# We pace requests proactively to stay under this instead of bursting and getting 429s.
-ITPM_LIMIT          = int(os.getenv("AI_REVIEWER_ITPM", "30000"))
-
-# Generated / non-reviewable files: skip them entirely. Reviewing them is useless
-# and a single one (e.g. a minified .tsbuildinfo on one giant line) can be 150k+
-# tokens and blow the whole rate-limit budget by itself.
-SKIP_EXTENSIONS     = {".lock", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
-                       ".tsbuildinfo", ".map", ".snap", ".min.js", ".min.css"}
-SKIP_FILENAMES      = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-                       "composer.lock", "Gemfile.lock", "poetry.lock", "Cargo.lock"}
-# Catch-all: any file whose diff is this big is almost certainly generated.
-MAX_DIFF_TOKENS     = 30000
+# Generated / non-reviewable files: skip entirely.
+SKIP_EXTENSIONS = {".lock", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+                   ".tsbuildinfo", ".map", ".snap", ".min.js", ".min.css"}
+SKIP_FILENAMES  = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                   "composer.lock", "Gemfile.lock", "poetry.lock", "Cargo.lock"}
+MAX_DIFF_TOKENS = 30000  # files this large are almost certainly generated
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +76,29 @@ def get_repo_root() -> str:
     return r.stdout.strip()
 
 
+def grep_repo(pattern: str, repo_root: str, max_lines: int = GREP_MAX_LINES) -> str:
+    """git grep (tracked + untracked) so the model can surface cross-file leads cheaply."""
+    try:
+        r = subprocess.run(
+            ["git", "grep", "-n", "-I", "--no-color", "--untracked", "-e", pattern],
+            cwd=repo_root, capture_output=True, text=True, timeout=20,
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"(grep failed for '{pattern}': {e})"
+    out = r.stdout.strip()
+    if not out:
+        return f"(no matches for: {pattern})"
+    rows = out.split("\n")
+    capped = "\n".join(rows[:max_lines])
+    extra = f"\n… (+{len(rows) - max_lines} more)" if len(rows) > max_lines else ""
+    return f"matches for '{pattern}':\n{capped}{extra}"
+
+
 # ---------------------------------------------------------------------------
-# Project config
+# Project config (optional context, cached in the system prompt)
 # ---------------------------------------------------------------------------
 
 def load_project_config(config_path: str | None) -> dict:
-    """Load project.json config if provided. Returns empty dict if not."""
     if not config_path:
         return {}
     config_path = os.path.expanduser(config_path)
@@ -100,310 +108,65 @@ def load_project_config(config_path: str | None) -> dict:
         return json.load(f)
 
 
-def get_always_include_files(
-    file_path: str,
-    project_config: dict,
-    repo_root: str,
-) -> dict[str, str]:
-    """
-    Auto-load files defined in always_include when diff file matches a pattern.
-    """
-    always_include = project_config.get("always_include", [])
-    extra: dict[str, str] = {}
-
-    for rule in always_include:
-        pattern = rule.get("pattern", "")
-        if not pattern:
-            continue
-        if re.search(pattern, file_path, re.IGNORECASE):
-            for inc_path in rule.get("files", []):
-                if inc_path not in extra:
-                    content = read_file(inc_path, repo_root, hunks=None)
-                    if content:
-                        extra[inc_path] = content
-
-    return extra
-
-
-def resolve_import_path(raw_path: str, project_config: dict) -> str:
-    """Resolve import alias to real path using project config."""
-    aliases = project_config.get("import_aliases", {})
-    for alias, real in aliases.items():
-        if raw_path.startswith(alias):
-            return raw_path.replace(alias, real, 1)
-    return raw_path
-
-
 def build_project_context_section(project_config: dict) -> str:
-    """Build project context string to inject into prompt."""
     if not project_config:
         return ""
-
     parts = []
-
     name = project_config.get("name", "")
     if name:
         parts.append(f"Project: {name}")
-
     stack = project_config.get("stack", {})
     if stack:
         langs = ", ".join(stack.get("languages", []))
         frameworks = ", ".join(stack.get("frameworks", []))
-        libs = stack.get("key_libs", [])
         if langs:
             parts.append(f"Languages: {langs}")
         if frameworks:
             parts.append(f"Frameworks: {frameworks}")
-        if libs:
-            parts.append("Key libraries:")
-            for lib in libs:
-                parts.append(f"  - {lib}")
-
-    structure = project_config.get("structure", "")
-    if structure:
-        parts.append("\nProject structure:\n" + structure.strip())
-
-    intentional = project_config.get("intentional_patterns", "")
-    if intentional:
-        parts.append("\nINTENTIONAL PATTERNS (do NOT flag these as bugs):\n" + intentional.strip())
-
-    rules = project_config.get("review_rules", "")
-    if rules:
-        parts.append("\nPROJECT REVIEW RULES (apply these as priorities):\n" + rules.strip())
-
-    additional = project_config.get("additional_context", "")
-    if additional:
-        parts.append("\nADDITIONAL PROJECT CONTEXT:\n" + additional.strip())
-
+        for lib in stack.get("key_libs", []):
+            parts.append(f"  - {lib}")
+    for key, label in (
+        ("structure", "Project structure"),
+        ("intentional_patterns", "INTENTIONAL PATTERNS (do NOT flag these)"),
+        ("review_rules", "PROJECT REVIEW RULES"),
+        ("additional_context", "ADDITIONAL PROJECT CONTEXT"),
+    ):
+        val = project_config.get(key, "")
+        if val:
+            parts.append(f"\n{label}:\n{val.strip()}")
     if not parts:
         return ""
-
     return "--- PROJECT CONTEXT ---\n" + "\n".join(parts) + "\n--- END PROJECT CONTEXT ---"
 
 
-
 # ---------------------------------------------------------------------------
-# Diff parsing
+# Diff parsing (per-file, diff text only)
 # ---------------------------------------------------------------------------
 
 def parse_diff_by_file(diff: str) -> list[dict]:
     files = []
     current: dict | None = None
-    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-
     for line in diff.split("\n"):
         if line.startswith("diff --git "):
             if current:
                 files.append(current)
             match = re.search(r" b/(.+)$", line)
             file_path = match.group(1) if match else "unknown"
-            current = {"file": file_path, "diff": line + "\n", "hunks": []}
+            current = {"file": file_path, "diff": line + "\n"}
         elif current is not None:
             current["diff"] += line + "\n"
-            m = hunk_re.match(line)
-            if m:
-                start = int(m.group(1))
-                length = int(m.group(2)) if m.group(2) else 1
-                current["hunks"].append({"start": start, "end": start + length})
-
     if current:
         files.append(current)
     return files
 
 
 # ---------------------------------------------------------------------------
-# File reading
-# ---------------------------------------------------------------------------
-
-def read_file(file_path: str, repo_root: str, hunks: list[dict] | None = None) -> str | None:
-    """
-    Read a file from repo. If hunks provided and file is large — return context only.
-    If hunks is None (lookup request) — return full file up to 500 lines.
-    """
-    full_path = os.path.join(repo_root, file_path)
-    if not os.path.exists(full_path):
-        return None
-
-    try:
-        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-    except Exception:
-        return None
-
-    total = len(lines)
-
-    # For lookup requests — return full file capped at 500 lines
-    if hunks is None:
-        cap = 500
-        content = "".join(lines[:cap])
-        truncated = f" (truncated to {cap} lines)" if total > cap else ""
-        return f"=== FILE: {file_path} ({total} lines{truncated}) ===\n{content}"
-
-    # For diff file — full if small, context if large
-    if total <= MAX_FULL_FILE_LINES:
-        return f"=== FULL FILE: {file_path} ({total} lines) ===\n{''.join(lines)}"
-
-    segments = []
-    covered: set[int] = set()
-    for hunk in hunks:
-        lo = max(0, hunk["start"] - HUNK_CONTEXT_LINES - 1)
-        hi = min(total, hunk["end"] + HUNK_CONTEXT_LINES)
-        seg = []
-        for i in range(lo, hi):
-            if i not in covered:
-                seg.append(f"{i+1:4d} | {lines[i]}")
-                covered.add(i)
-        if seg:
-            segments.append(f"--- {file_path} lines {lo+1}–{hi} ---\n" + "".join(seg))
-
-    if not segments:
-        return None
-
-    return (
-        f"=== CONTEXT: {file_path} ({total} lines total, "
-        f"showing {len(covered)} lines around changes) ===\n"
-        + "\n".join(segments)
-    )
-
-
-# ---------------------------------------------------------------------------
-# RAG
-# ---------------------------------------------------------------------------
-
-def search_similar_comments(
-    diff_chunk: str,
-    openai_client: OpenAI,
-    collection: chromadb.Collection,
-    top_n: int = TOP_N_COMMENTS,
-) -> list[dict]:
-    r = openai_client.embeddings.create(model=EMBEDDING_MODEL, input=diff_chunk[:6000])
-    vec = r.data[0].embedding
-
-    results = collection.query(
-        query_embeddings=[vec],
-        n_results=min(top_n, collection.count()),
-        include=["metadatas", "distances"],
-    )
-
-    comments = []
-    seen: set[str] = set()
-    for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
-        if 1 - dist < MIN_SIMILARITY:
-            continue
-        body = meta.get("body", "").strip()
-        key = body[:100]
-        if key in seen:
-            continue
-        seen.add(key)
-        comments.append({"file": meta.get("file", ""), "body": body})
-
-    return comments
-
-
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-
-def build_system_prompt(project_context: str = "") -> str:
-    """
-    Static instructions shared by every file and every agentic round.
-    Kept identical across requests so it can be served from the prompt cache.
-    """
-    project_section = ("\n" + project_context + "\n") if project_context else ""
-
-    return f"""You are a senior code reviewer doing a pre-PR review.
-{project_section}
-STRICT SEVERITY RULES:
-- "critical": real bug / data loss / crash / security. ONLY with confidence "high" AND evidence from the full file context. NEVER if the issue depends on logic in another file you haven't seen.
-- "important": wrong pattern, missing type safety, performance issue, missing error handling
-- "minor": style, naming, missing comment, small improvement. This includes: "add a comment", "rename variable", "test structure", "extract constant", "add TODO"
-- If you cannot see the full function — do NOT mark CRITICAL. Request the file instead.
-- If a guard/null-check exists elsewhere in the same file — do NOT flag it as missing.
-- Do NOT invent references to past comments. Only use what is provided.
-
-If you need to see another file to verify a potential CRITICAL finding, respond with:
-{{"action": "need_files", "files": ["path/to/file.ts", "path/to/other.kt"], "reason": "why you need them"}}
-
-Otherwise respond with a JSON array of findings:
-[
-  {{
-    "severity": "critical" | "important" | "minor",
-    "confidence": "high" | "medium" | "low",
-    "file": "the file path under review",
-    "line": "line number or range",
-    "title": "short title",
-    "problem": "what is wrong and why it matters",
-    "fix": "how to fix it, code snippet if helpful",
-    "evidence": "exact quote from file context confirming the issue"
-  }}
-]
-
-Return ONLY valid JSON — either the need_files object or the findings array. No other text."""
-
-
-def build_initial_prompt(
-    file_path: str,
-    diff: str,
-    file_context: str | None,
-    similar_comments: list[dict],
-    extra_files: dict[str, str],
-) -> str:
-    comments_text = "\n".join(
-        f"- [{c['file']}] {c['body']}" for c in similar_comments
-    ) or "No similar past comments found."
-
-    context_section = ""
-    if file_context:
-        context_section = f"\n--- PRIMARY FILE CONTEXT ---\n{file_context}\n--- END ---\n"
-
-    extra_section = ""
-    if extra_files:
-        parts = [f"\n--- ADDITIONAL FILE: {path} ---\n{content}\n--- END ---"
-                 for path, content in extra_files.items()]
-        extra_section = "\n".join(parts)
-
-    return f"""Review this file: {file_path}
-
-PAST TEAM COMMENTS (style guidance only):
-{comments_text}
-
-DIFF TO REVIEW:
-{diff}
-{context_section}{extra_section}
-
-Apply the STRICT SEVERITY RULES and respond per the output format above."""
-
-
-def build_followup_prompt(reason: str, extra_files: dict[str, str]) -> str:
-    parts = [f"\n--- FILE: {path} ---\n{content}\n--- END ---"
-             for path, content in extra_files.items()]
-    files_text = "\n".join(parts)
-
-    return f"""You requested these files to verify your findings: {reason}
-
-{files_text}
-
-Now provide your final review as a JSON array of findings.
-Apply the same STRICT SEVERITY RULES as before.
-Return ONLY the JSON array, no other text."""
-
-
-# ---------------------------------------------------------------------------
-# Agentic review loop
+# Rate limiting
 # ---------------------------------------------------------------------------
 
 class TokenRateLimiter:
-    """
-    Proactively paces requests to stay under a per-minute input-token budget.
-
-    The API limit is 30k input tokens per *minute*, not per request. Firing
-    requests back-to-back blows past it instantly. Before each request we wait
-    until the tokens spent in the trailing 60s window leave room for the next
-    one. Cheaper and faster than bursting into 429s and waiting them out.
-    """
-
-    def __init__(self, limit: int, window: float = 60.0, safety: float = 0.9):
-        self.budget = max(1, int(limit * safety))  # margin below the hard limit
+    def __init__(self, limit: int, window: float = 60.0, safety: float = 0.95):
+        self.budget = max(1, int(limit * safety))
         self.window = window
         self.events: deque[tuple[float, int]] = deque()
 
@@ -416,15 +179,12 @@ class TokenRateLimiter:
         while True:
             now = time.monotonic()
             used = self._used(now)
-            # If nothing is in flight we always proceed, even if a single request
-            # exceeds the budget — we can't split it, so let the server arbitrate.
             if not self.events or used + est_tokens <= self.budget:
                 return
             sleep_for = self.window - (now - self.events[0][0]) + 0.5
             if sleep_for <= 0:
                 continue
-            print(f"  ⏳ Pacing: ~{used} tok used in last 60s, "
-                  f"waiting {sleep_for:.0f}s to stay under {self.budget}/min...")
+            print(f"  ⏳ Pacing: ~{used} tok in last 60s, waiting {sleep_for:.0f}s...")
             time.sleep(sleep_for)
 
     def record(self, tokens: int) -> None:
@@ -435,42 +195,24 @@ _RATE_LIMITER = TokenRateLimiter(ITPM_LIMIT)
 
 
 def _estimate_input_tokens(system, messages) -> int:
-    """Rough char/3 estimate of input tokens, used to pace before sending."""
     chars = 0
     for block in (system or []):
         chars += len(block.get("text", ""))
     for msg in messages:
         content = msg.get("content", "")
-        if isinstance(content, str):
-            chars += len(content)
-        else:
-            for block in content:
-                chars += len(block.get("text", "")) if isinstance(block, dict) else len(str(block))
-    return chars // 3  # conservative: ~3 chars/token, overestimates to pace safely
+        chars += len(content) if isinstance(content, str) else len(str(content))
+    return chars // 3
 
 
-def create_message_with_retry(
-    claude_client: anthropic.Anthropic,
-    max_attempts: int = 8,
-    **kwargs,
-):
-    """
-    Wrapper around messages.create that paces requests under the per-minute
-    token budget and waits out any residual 429 rate-limit errors.
-
-    Honors the Retry-After header when present; fails fast if the wait is huge
-    (a sign the requests are simply too big for the tier). Logs while waiting so
-    the run doesn't look hung.
-    """
+def create_message_with_retry(claude_client, max_attempts: int = 8, **kwargs):
     est = _estimate_input_tokens(kwargs.get("system"), kwargs.get("messages", []))
     for attempt in range(1, max_attempts + 1):
         _RATE_LIMITER.acquire(est)
         try:
             response = claude_client.messages.create(**kwargs)
             usage = response.usage
-            billed = (usage.input_tokens
-                      + getattr(usage, "cache_read_input_tokens", 0)
-                      + getattr(usage, "cache_creation_input_tokens", 0))
+            # Cache reads are cheap and limited separately — don't count them.
+            billed = usage.input_tokens + getattr(usage, "cache_creation_input_tokens", 0)
             _RATE_LIMITER.record(billed)
             return response
         except anthropic.RateLimitError as err:
@@ -482,136 +224,129 @@ def create_message_with_retry(
             except (AttributeError, TypeError, ValueError):
                 pass
             wait = retry_after if retry_after is not None else min(60, 2 ** attempt)
-            # A huge Retry-After means we're hard-throttled — waiting 10+ min per
-            # request is pointless. Fail fast with actionable guidance instead.
             if wait > MAX_RETRY_WAIT:
                 raise RuntimeError(
-                    f"Rate limited for {wait:.0f}s — your requests are too large for "
-                    f"the current per-minute token limit. Reduce prompt size "
-                    f"(MAX_LOOKUP_ROUNDS, project.json) or raise your API tier, then retry."
+                    f"Rate limited for {wait:.0f}s — requests too large for the tier."
                 ) from err
-            print(f"  ⏳ Rate limited; waiting {wait:.0f}s "
-                  f"(attempt {attempt}/{max_attempts})...")
+            print(f"  ⏳ Rate limited; waiting {wait:.0f}s (attempt {attempt}/{max_attempts})...")
             time.sleep(wait)
 
 
-def agentic_review_file(
-    file_path: str,
-    file_diff: str,
-    file_context: str | None,
-    similar_comments: list[dict],
-    repo_root: str,
-    claude_client: anthropic.Anthropic,
-    project_context: str = "",
-    project_config: dict | None = None,
-) -> list[dict]:
-    """
-    Review a single file with agentic file lookup.
-    Claude can request up to MAX_LOOKUP_FILES extra files before giving final answer.
-    """
-    extra_files: dict[str, str] = {}
-    fetched_files: set[str] = set()
-    messages = []
+# ---------------------------------------------------------------------------
+# Review (single-shot, diff-only)
+# ---------------------------------------------------------------------------
 
-    # Static instructions go in a cached system prompt — identical for every file
-    # and every round, so after the first request they cost ~0 input tokens.
+FINDING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "file":       {"type": "string"},
+        "line":       {"type": "string"},
+        "title":      {"type": "string"},
+        "problem":    {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "crossfile":  {"type": "boolean",
+                       "description": "true if found via grep as a cross-file inconsistency lead"},
+    },
+    "required": ["file", "title", "problem"],
+}
+
+GREP_TOOL = {
+    "name": "grep",
+    "description": (
+        "Search the repo (git grep) to surface CROSS-FILE inconsistency leads — e.g. compare a "
+        "changed symbol against an existing sibling hook/util/type. Use at most once. Do not try "
+        "to confirm anything; just gather enough to phrase a lead."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "patterns": {"type": "array", "items": {"type": "string"}},
+            "reason":   {"type": "string"},
+        },
+        "required": ["patterns"],
+    },
+}
+
+SUBMIT_TOOL = {
+    "name": "submit_findings",
+    "description": "Submit all candidate findings. Call exactly once when done.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"findings": {"type": "array", "items": FINDING_SCHEMA}},
+        "required": ["findings"],
+    },
+}
+
+
+def build_system_prompt(project_context: str = "") -> str:
+    project_section = ("\n" + project_context + "\n") if project_context else ""
+    return f"""You are a fast first-pass code reviewer.
+{project_section}
+Look mainly at the diff below and list EVERY plausible issue from the changed lines —
+bugs, risky patterns, missing error handling, type issues, dead code. Over-reporting is
+fine; a separate step verifies everything. Be fast and broad.
+
+CROSS-FILE LEADS (the most valuable output): when a changed symbol resembles an existing
+sibling (hook/util/type/component), you MAY call `grep` ONCE to find it and surface
+inconsistencies as leads — set crossfile=true and phrase the title as "cross-file: check
+X vs Y". Do NOT try to confirm a lead; just surface it for the verification step.
+
+Do NOT flag these (predictable noise):
+- import sources (which module a symbol is imported from) or whether code is in/out of
+  project scope — you don't know the conventions or the roadmap;
+- deleted/renamed/removed exports as "may break consumers" — a separate step verifies refs.
+- NEVER claim a file or symbol "does not exist" / "is missing". git grep is NOT
+  authoritative for absence (untracked files, path guesses, generated code). If grep
+  returns nothing, drop the point — do not report it.
+- If the SAME inconsistency spans several files (e.g. one rename), emit ONE lead that
+  lists the affected files — do not repeat it per file.
+
+Keep each `problem` to ONE short sentence. Set `confidence` honestly. After at most one
+grep, call submit_findings with all candidates."""
+
+
+def review_file(file_path: str, file_diff: str, repo_root: str, claude_client,
+                project_context: str = "") -> list[dict]:
     system = [{
         "type": "text",
         "text": build_system_prompt(project_context),
         "cache_control": {"type": "ephemeral"},
     }]
+    messages = [{
+        "role": "user",
+        "content": f"Review this diff for `{file_path}`. Report every plausible issue.\n\n{file_diff}",
+    }]
+    tools = [GREP_TOOL, SUBMIT_TOOL]
 
-    # Round 1 — initial review
-    initial_prompt = build_initial_prompt(
-        file_path, file_diff, file_context, similar_comments, extra_files,
-    )
-    messages.append({"role": "user", "content": initial_prompt})
-
-    for round_num in range(1, MAX_LOOKUP_ROUNDS + 1):
+    for round_num in range(1, MAX_LEAD_ROUNDS + 1):
+        final = round_num == MAX_LEAD_ROUNDS
+        tool_choice = {"type": "tool", "name": "submit_findings"} if final else {"type": "any"}
         response = create_message_with_retry(
-            claude_client,
-            model=CLAUDE_MODEL,
-            max_tokens=3000,
-            system=system,
-            messages=messages,
+            claude_client, model=CLAUDE_MODEL, max_tokens=4000,
+            system=system, messages=messages, tools=tools, tool_choice=tool_choice,
         )
-        raw = response.content[0].text.strip()
-
-        # Strip code fences
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            print(f"  ⚠️  Could not parse JSON (round {round_num}): {raw[:150]}")
+        tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
+        if not tool_uses:
             return []
 
-        # Claude wants more files
-        if isinstance(parsed, dict) and parsed.get("action") == "need_files":
-            requested = parsed.get("files", [])
-            reason = parsed.get("reason", "")
+        submit = next((b for b in tool_uses if b.name == "submit_findings"), None)
+        if submit:
+            findings = submit.input.get("findings", []) if isinstance(submit.input, dict) else []
+            return findings if isinstance(findings, list) else []
 
-            if round_num >= MAX_LOOKUP_ROUNDS:
-                print(f"  ⚠️  Max lookup rounds reached, proceeding without extra files")
-                # Force final answer
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({
-                    "role": "user",
-                    "content": "Max file lookups reached. Give your best final review now as a JSON array. If you cannot confirm a CRITICAL finding without the missing files, downgrade it to important."
-                })
-                continue
-
-            # Read requested files
-            newly_fetched: dict[str, str] = {}
-            for req_path in requested[:MAX_LOOKUP_FILES]:
-                if req_path in fetched_files:
-                    continue
-                # Normalize path — strip leading /
-                clean_path = req_path.lstrip("/")
-                # Resolve import aliases if project config provided
-                if project_config:
-                    clean_path = resolve_import_path(clean_path, project_config)
-                content = read_file(clean_path, repo_root, hunks=None)
-                if content:
-                    newly_fetched[clean_path] = content
-                    fetched_files.add(req_path)
-                    print(f"  🔍 Fetched: {clean_path}")
-                else:
-                    print(f"  ❌ Not found: {clean_path}")
-
-            if not newly_fetched:
-                # Nothing found — force final answer
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({
-                    "role": "user",
-                    "content": "The requested files were not found in the repo. Give your final review as a JSON array without them. Downgrade any unverified CRITICAL to important."
-                })
-                continue
-
-            extra_files.update(newly_fetched)
-            messages.append({"role": "assistant", "content": raw})
-            messages.append({
-                "role": "user",
-                "content": build_followup_prompt(reason, newly_fetched),
-            })
-            continue
-
-        # Claude returned findings array
-        if isinstance(parsed, list):
-            # Downgrade low-confidence criticals
-            for f in parsed:
-                if f.get("severity") == "critical" and f.get("confidence") != "high":
-                    f["severity"] = "important"
-                    f["title"] = f.get("title", "") + " (downgraded: unverified)"
-            lookup_count = len(fetched_files)
-            if lookup_count:
-                print(f"  🔍 Used {lookup_count} extra file(s) for verification")
-            return parsed
-
-        print(f"  ⚠️  Unexpected response shape: {str(parsed)[:100]}")
-        return []
+        # grep round — surface leads, feed results back, then force submit next round.
+        messages.append({"role": "assistant", "content": response.content})
+        results = []
+        for b in tool_uses:
+            if b.name == "grep":
+                patterns = (b.input or {}).get("patterns", [])[:8]
+                if patterns:
+                    print(f"  🔎 grep: {', '.join(patterns)}")
+                out = "\n\n".join(grep_repo(p, repo_root) for p in patterns) or "(no patterns)"
+            else:
+                out = f"Unknown tool: {b.name}"
+            results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+        messages.append({"role": "user", "content": results})
 
     return []
 
@@ -620,11 +355,17 @@ def agentic_review_file(
 # Dedup
 # ---------------------------------------------------------------------------
 
+def _norm_title(title: str) -> str:
+    t = re.sub(r"\(downgraded[^)]*\)", "", title or "").lower()
+    t = re.sub(r"[^a-z0-9 ]+", "", t)  # strip backticks/punctuation
+    return re.sub(r"\s+", " ", t).strip()[:60]
+
+
 def dedup_findings(findings: list[dict]) -> list[dict]:
     seen: set[str] = set()
     result = []
     for f in findings:
-        key = f"{f.get('file', '')}::{f.get('title', '')[:50].lower()}"
+        key = f"{f.get('file', '')}::{_norm_title(f.get('title', ''))}"
         if key not in seen:
             seen.add(key)
             result.append(f)
@@ -635,112 +376,71 @@ def dedup_findings(findings: list[dict]) -> list[dict]:
 # Markdown rendering
 # ---------------------------------------------------------------------------
 
-SEVERITY_EMOJI = {"critical": "🔴", "important": "🟠", "minor": "🟢"}
-SEVERITY_ORDER = {"critical": 0, "important": 1, "minor": 2}
 CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
-def findings_to_markdown(
-    findings: list[dict],
-    current_branch: str,
-    base_branch: str,
-    diff_lines: int,
-) -> str:
-    if not findings:
-        return (
-            f"# Code Review\n"
-            f"**Branch:** `{current_branch}` → `{base_branch}`\n"
-            f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-            f"**Diff size:** {diff_lines} lines\n\n---\n\n✅ No issues found.\n"
-        )
+def _problem(f: dict) -> str:
+    p = re.sub(r"\s+", " ", f.get("problem", "")).strip()
+    return p[:200].rstrip() + "…" if len(p) > 200 else p
 
-    sorted_findings = sorted(
-        findings,
-        key=lambda f: (
-            SEVERITY_ORDER.get(f.get("severity", "minor"), 2),
-            CONFIDENCE_ORDER.get(f.get("confidence", "low"), 2),
-        ),
+
+def _conf_tag(f: dict) -> str:
+    conf = f.get("confidence", "low")
+    return "" if conf == "high" else f" _({conf})_"
+
+
+def findings_to_markdown(findings, current_branch, base_branch, diff_lines) -> str:
+    header = (
+        f"# Code Review (first-pass, unverified)\n"
+        f"**Branch:** `{current_branch}` → `{base_branch}`\n"
+        f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"**Diff size:** {diff_lines} lines\n"
+    )
+    if not findings:
+        return header + "\n✅ No candidate issues found.\n"
+
+    leads = [f for f in findings if f.get("crossfile")]
+    rest  = sorted(
+        (f for f in findings if not f.get("crossfile")),
+        key=lambda f: CONFIDENCE_ORDER.get(f.get("confidence", "low"), 2),
     )
 
-    by_file: dict[str, list[dict]] = {}
-    for f in sorted_findings:
-        by_file.setdefault(f.get("file", "unknown"), []).append(f)
-
-    critical  = sum(1 for f in sorted_findings if f.get("severity") == "critical")
-    important = sum(1 for f in sorted_findings if f.get("severity") == "important")
-    minor     = sum(1 for f in sorted_findings if f.get("severity") == "minor")
-
     lines = [
-        "# Code Review",
-        f"**Branch:** `{current_branch}` → `{base_branch}`",
-        f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"**Diff size:** {diff_lines} lines",
-        f"**Findings:** 🔴 {critical} critical · 🟠 {important} important · 🟢 {minor} minor",
-        "", "---", "",
+        header.rstrip("\n"),
+        f"**Candidates:** {len(findings)}  ·  🔗 {len(leads)} cross-file leads  "
+        f"—  unverified first-pass, run counter-review",
+        "",
     ]
 
+    # Cross-file leads first — the part the counter-review can't cheaply reproduce.
+    if leads:
+        lines.append("## 🔗 Cross-file leads (check these first)")
+        for f in sorted(leads, key=lambda f: CONFIDENCE_ORDER.get(f.get("confidence", "low"), 2)):
+            loc = f":{f['line']}" if f.get("line") else ""
+            lines.append(f"- **{f.get('title', 'Issue')}**{_conf_tag(f)} "
+                         f"— `{f.get('file', '?')}{loc}` — {_problem(f)}")
+        lines.append("")
+
+    by_file: dict[str, list[dict]] = {}
+    for f in rest:
+        by_file.setdefault(f.get("file", "unknown"), []).append(f)
     for file_path, file_findings in by_file.items():
         lines.append(f"## `{file_path}`")
-        lines.append("")
         for f in file_findings:
-            severity   = f.get("severity", "minor")
-            confidence = f.get("confidence", "low")
-            emoji      = SEVERITY_EMOJI.get(severity, "🟢")
-            conf_note  = f" _(confidence: {confidence})_" if confidence != "high" else ""
-
-            lines.append(f"### {emoji} {severity.upper()} — {f.get('title', 'Issue')}{conf_note}")
-            lines.append("")
-            if f.get("line"):
-                lines.append(f"**Line:** {f['line']}")
-                lines.append("")
-            lines.append(f"**Problem:** {f.get('problem', '')}")
-            lines.append("")
-            if f.get("fix"):
-                lines.append("**Fix:**")
-                lines.append("```")
-                lines.append(f.get("fix", ""))
-                lines.append("```")
-                lines.append("")
-            if f.get("evidence"):
-                lines.append(f"**Evidence:** _{f.get('evidence', '')}_")
-                lines.append("")
-            lines.append("---")
-            lines.append("")
-
-    lines += [
-        "## Summary",
-        "",
-        f"🔴 **{critical} critical** — must fix before merge." if critical else "",
-        f"🟠 **{important} important** — should fix before merge." if important else "",
-        f"🟢 **{minor} minor** — consider fixing for code quality." if minor else "",
-        "",
-        "> ⚠️ Always verify CRITICAL findings manually.",
-        "> Reviewer reads full file context + dependency files, but may miss product intent.",
-    ]
-
-    return "\n".join(l for l in lines)
+            loc = f" L{f['line']}" if f.get("line") else ""
+            lines.append(f"- **{f.get('title', 'Issue')}**{_conf_tag(f)}{loc} — {_problem(f)}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def review_diff(
-    base_branch: str = "main",
-    db_path: str = "db/chroma",
-    top_n: int = TOP_N_COMMENTS,
-    project_config_path: str | None = None,
-) -> None:
-    openai_key    = os.getenv("OPENAI_API_KEY")
+def review_diff(base_branch: str = "main", project_config_path: str | None = None) -> None:
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-
-    if not openai_key:
-        raise ValueError("OPENAI_API_KEY not found in .env")
     if not anthropic_key:
         raise ValueError("ANTHROPIC_API_KEY not found in .env")
-    db_path = os.path.expanduser(db_path)
-    if not os.path.exists(db_path):
-        raise FileNotFoundError(f"Database not found at '{db_path}'. Run embed.py first.")
 
     project_config = load_project_config(project_config_path)
     if project_config:
@@ -748,65 +448,33 @@ def review_diff(
 
     current_branch = get_current_branch()
     repo_root      = get_repo_root()
-
-    print(f"Branch:    {current_branch}")
-    print(f"Base:      {base_branch}")
-    print(f"Repo root: {repo_root}")
+    print(f"Branch: {current_branch}")
+    print(f"Base:   {base_branch}")
     print(f"Diffing {base_branch}...{current_branch}\n")
 
     diff       = get_diff(base_branch, current_branch)
     diff_lines = diff.count("\n")
     file_diffs = parse_diff_by_file(diff)
-
     print(f"Diff size:     {diff_lines} lines")
-    print(f"Changed files: {len(file_diffs)}")
+    print(f"Changed files: {len(file_diffs)}\n")
 
-    chroma_client = chromadb.PersistentClient(
-        path=db_path,
-        settings=chromadb.Settings(anonymized_telemetry=False),
-    )
-    collection    = chroma_client.get_collection(name=COLLECTION_NAME)
-    print(f"Knowledge base: {collection.count()} comments\n")
-
-    openai_client = OpenAI(api_key=openai_key)
-    claude_client = anthropic.Anthropic(api_key=anthropic_key, max_retries=4)
-
+    claude_client   = anthropic.Anthropic(api_key=anthropic_key, max_retries=4)
     project_context = build_project_context_section(project_config)
     all_findings: list[dict] = []
 
     for i, entry in enumerate(file_diffs, 1):
-        file_path = entry["file"]
-        file_diff = entry["diff"]
-        hunks     = entry["hunks"]
-
+        file_path, file_diff = entry["file"], entry["diff"]
         print(f"[{i}/{len(file_diffs)}] {file_path}")
 
         basename = os.path.basename(file_path)
         if any(file_path.endswith(ext) for ext in SKIP_EXTENSIONS) or basename in SKIP_FILENAMES:
             print("  Skipped (generated/binary/lock)")
             continue
-        diff_tokens = len(file_diff) // 3
-        if diff_tokens > MAX_DIFF_TOKENS:
-            print(f"  Skipped (~{diff_tokens} tok diff — looks generated, would blow rate limit)")
+        if len(file_diff) // 3 > MAX_DIFF_TOKENS:
+            print("  Skipped (huge diff — looks generated)")
             continue
 
-        file_context = read_file(file_path, repo_root, hunks)
-        ctx_info = f"{file_context.count(chr(10))} lines" if file_context else "not available"
-        print(f"  Context: {ctx_info}")
-
-        similar = search_similar_comments(file_diff, openai_client, collection, top_n)
-        print(f"  Past comments: {len(similar)}")
-
-        # Auto-load always_include files from project config
-        auto_files = get_always_include_files(file_path, project_config, repo_root)
-        if auto_files:
-            print(f"  Auto-included: {list(auto_files.keys())}")
-
-        findings = agentic_review_file(
-            file_path, file_diff, file_context, similar, repo_root, claude_client,
-            project_context=project_context,
-            project_config=project_config,
-        )
+        findings = review_file(file_path, file_diff, repo_root, claude_client, project_context)
         print(f"  Findings: {len(findings)}")
         all_findings.extend(findings)
 
@@ -818,26 +486,19 @@ def review_diff(
     markdown  = findings_to_markdown(deduped, current_branch, base_branch, diff_lines)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     output    = f"review_{timestamp}.md"
-
     with open(output, "w", encoding="utf-8") as f:
         f.write(markdown)
 
-    print(f"\n✅ Review saved to: {output}")
-    print(f"   {len(deduped)} findings ({sum(1 for f in deduped if f.get('severity')=='critical')} critical)\n")
+    print(f"\n✅ Review saved to: {output}  ({len(deduped)} candidate findings)\n")
 
 
 def main() -> None:
-    # Read defaults from .env if set
-    default_db      = os.getenv("AI_REVIEWER_DB", "db/chroma")
     default_project = os.getenv("AI_REVIEWER_PROJECT", None)
-
-    parser = argparse.ArgumentParser(description="AI code reviewer with agentic file lookup")
-    parser.add_argument("--base",    default="main", help="Base branch to diff against (default: main)")
-    parser.add_argument("--db",      default=default_db, help="ChromaDB path (default: AI_REVIEWER_DB or db/chroma)")
-    parser.add_argument("--top",     type=int, default=TOP_N_COMMENTS)
-    parser.add_argument("--project", default=default_project, help="Path to project config json (default: AI_REVIEWER_PROJECT)")
+    parser = argparse.ArgumentParser(description="Fast first-pass (diff-only) code reviewer")
+    parser.add_argument("--base",    default="main", help="Base branch to diff against")
+    parser.add_argument("--project", default=default_project, help="Path to project config json")
     args = parser.parse_args()
-    review_diff(base_branch=args.base, db_path=args.db, top_n=args.top, project_config_path=args.project)
+    review_diff(base_branch=args.base, project_config_path=args.project)
 
 
 if __name__ == "__main__":
